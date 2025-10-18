@@ -67,6 +67,22 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # Skip authentication for health checks and static files
         if request.url.path in ["/health", "/favicon.ico"]:
             return await call_next(request)
+
+        # Allow unauthenticated access to well-known discovery endpoints
+        path = request.url.path or ""
+        if (
+            path.startswith("/.well-known/")
+            or path.startswith("/sse/.well-known/")
+            or path in {
+                "/.well-known/openid-configuration",
+                "/.well-known/oauth-authorization-server",
+                "/.well-known/jwks.json",
+                "/sse/.well-known/openid-configuration",
+                "/sse/.well-known/oauth-authorization-server",
+                "/sse/.well-known/jwks.json",
+            }
+        ):
+            return await call_next(request)
         
         # Check if authentication is disabled
         if not self.authenticator or self.authenticator.config.disable_auth:

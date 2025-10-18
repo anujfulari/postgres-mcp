@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# pyright: reportMissingImports=false, reportUntypedFunctionDecorator=false
+
 import asyncio
 import base64
 import json
@@ -109,6 +111,28 @@ class EmbeddedOAuthServer:
         @self._app.get("/.well-known/jwks.json")
         async def jwks() -> Dict[str, Any]:
             return {"keys": [self._jwk]}
+
+        @self._app.get("/.well-known/openid-configuration")
+        async def openid_config() -> Dict[str, Any]:
+            return {
+                "issuer": self._issuer,
+                "jwks_uri": f"{self._issuer}/.well-known/jwks.json",
+                "token_endpoint": f"{self._issuer}/oauth/token",
+                "grant_types_supported": ["client_credentials"],
+                "token_endpoint_auth_methods_supported": ["client_secret_post"],
+                "scopes_supported": self._default_scopes,
+            }
+
+        @self._app.get("/.well-known/oauth-authorization-server")
+        async def rfc8414_config() -> Dict[str, Any]:
+            return {
+                "issuer": self._issuer,
+                "jwks_uri": f"{self._issuer}/.well-known/jwks.json",
+                "token_endpoint": f"{self._issuer}/oauth/token",
+                "grant_types_supported": ["client_credentials"],
+                "token_endpoint_auth_methods_supported": ["client_secret_post"],
+                "scopes_supported": self._default_scopes,
+            }
 
         @self._app.post("/oauth/token", response_model=TokenResponse)
         async def token(request: Request) -> Any:
