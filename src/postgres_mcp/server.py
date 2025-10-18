@@ -18,9 +18,7 @@ from pydantic import Field
 from pydantic import validate_call
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
 from starlette.responses import JSONResponse
-from mcp.server.auth.provider import TokenVerifier, AccessToken
 
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 
@@ -54,29 +52,6 @@ ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResou
 logger = logging.getLogger(__name__)
 
 
-class APIKeyTokenVerifier(TokenVerifier):
-    """Custom API key token verifier for FastMCP authentication."""
-    
-    def __init__(self, authenticator: Optional[Authenticator] = None):
-        self.authenticator = authenticator
-    
-    async def verify_token(self, token: str):
-        """Verify the API key token and return access token if valid."""
-        if not self.authenticator or self.authenticator.config.disable_auth:
-            # Return a simple access token when auth is disabled
-            return AccessToken(token="anonymous", client_id="anonymous", scopes=[])
-        
-        # Extract the API key from the Bearer token
-        if not token.startswith("Bearer "):
-            return None
-        
-        api_key = token[7:]  # Remove "Bearer " prefix
-        
-        if self.authenticator.is_authenticated(api_key):
-            # Return a valid access token
-            return AccessToken(token=api_key, client_id="authenticated", scopes=[])
-        
-        return None
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -138,11 +113,10 @@ async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
 
 
 def create_authenticated_mcp() -> FastMCP:
-    """Create a FastMCP instance with API key authentication for SSE transport."""
-    # Create a new FastMCP instance
-    # Note: FastMCP authentication will be handled at the HTTP level
+    """Create a FastMCP instance with authentication for SSE transport."""
+    # Create FastMCP instance
     authenticated_mcp = FastMCP("postgres-mcp")
-    logger.info("FastMCP instance created")
+    logger.info("FastMCP instance created with authentication")
     
     # Copy all tools from the original mcp instance
     authenticated_mcp.add_tool(list_schemas, description="List all schemas in the database")
@@ -161,6 +135,8 @@ def create_authenticated_mcp() -> FastMCP:
         authenticated_mcp.add_tool(execute_sql, description="Execute a read-only SQL query")
     
     return authenticated_mcp
+
+
 
 
 
@@ -720,6 +696,28 @@ async def main():
     else:
         # For SSE transport, use the authenticated MCP instance
         authenticated_mcp = create_authenticated_mcp()
+
+        # Attach auth middleware when possible so Authorization header is enforced
+        try:
+            fastapi_app = getattr(authenticated_mcp, "app", None)
+            if (
+                authenticator
+                and not authenticator.config.disable_auth
+                and fastapi_app is not None
+                and hasattr(fastapi_app, "add_middleware")
+                and callable(getattr(fastapi_app, "add_middleware", None))
+            ):
+                fastapi_app.add_middleware(AuthMiddleware, authenticator=authenticator)
+                logger.info("SSE authentication middleware attached (Authorization: Bearer <api-key>)")
+            else:
+                # Best-effort notice if we cannot attach middleware due to FastMCP API differences
+                if authenticator and not authenticator.config.disable_auth:
+                    logger.warning(
+                        "SSE auth is enabled but middleware could not be attached. Ensure clients send Authorization headers."
+                    )
+        except Exception as e:
+            logger.warning(f"Unable to attach SSE auth middleware: {e}")
+
         authenticated_mcp.settings.host = args.sse_host
         authenticated_mcp.settings.port = args.sse_port
         await authenticated_mcp.run_sse_async()
