@@ -717,16 +717,37 @@ async def main():
                 app.add_middleware(AuthMiddleware, authenticator=authenticator)
                 logger.info("SSE authentication middleware attached (Authorization: Bearer <api-key>)")
                 
-                # Add well-known OAuth protected resource metadata endpoint
-                async def oauth_resource_meta(request: Request):
+                # Add well-known OAuth authorization server metadata endpoint (signals no dynamic registration)
+                async def oauth_authorization_server_meta(request: Request):
                     return JSONResponse(
                         {
-                            "authorization_servers": [authenticator.config.google_oidc_config_url],
-                            "resource": "mcp://postgres-mcp",
+                            "issuer": "https://accounts.google.com",
+                            "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+                            "token_endpoint": "https://oauth2.googleapis.com/token",
+                            "grant_types_supported": ["authorization_code"],
+                            "response_types_supported": ["code"],
+                            "scopes_supported": ["openid", "email", "profile"],
+                            # Explicitly indicate that dynamic client registration is not supported
+                            "registration_endpoint": None,
                         }
                     )
-                
+
+                # Add well-known OAuth protected resource metadata endpoint pointing to our auth server metadata
+                async def oauth_resource_meta(request: Request):
+                    base_url = f"{request.url.scheme}://{request.url.netloc}"
+                    return JSONResponse(
+                        {
+                            "authorization_servers": [f"{base_url}/.well-known/oauth-authorization-server"],
+                            "resource": f"mcp://{request.url.netloc}",
+                        }
+                    )
+
                 try:
+                    app.add_route(
+                        "/.well-known/oauth-authorization-server",
+                        oauth_authorization_server_meta,
+                        methods=["GET"],
+                    )
                     app.add_route(
                         "/.well-known/oauth-protected-resource",
                         oauth_resource_meta,
