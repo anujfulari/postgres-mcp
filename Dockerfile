@@ -13,10 +13,16 @@ WORKDIR /app
 RUN apt-get update \
   && apt-get install -y libpq-dev gcc \
   && rm -rf /var/lib/apt/lists/*
+
+# Copy minimal files for dependency resolution and lock generation
+COPY pyproject.toml /app/pyproject.toml
+
+# Generate/refresh lock and install dependencies (without installing project)
 RUN --mount=type=cache,target=/root/.cache/uv \
-  --mount=type=bind,source=uv.lock,target=uv.lock \
-  --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-  uv sync --no-install-project --no-dev
+  uv lock \
+  && uv sync --no-install-project --no-dev
+
+# Now add full source and install the project into the venv
 ADD . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
   uv sync --no-dev
