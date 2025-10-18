@@ -126,6 +126,10 @@ class StytchAuthMiddleware(BaseHTTPMiddleware):
         if request.url.path in ["/health", "/favicon.ico"] or request.url.path.startswith("/.well-known/"):
             return await call_next(request)
 
+        # Some clients probe discovery under the SSE mount path; redirect to OIDC
+        if request.url.path.startswith("/sse/.well-known/"):
+            return RedirectResponse(url=STYTCH_OIDC, status_code=307)
+
         if DISABLE_AUTH:
             return await call_next(request)
 
@@ -762,6 +766,10 @@ async def main():
 
             parent_app.add_route(
                 "/.well-known/oauth-protected-resource", well_known_protected_resource, methods=["GET"]
+            )
+            # Alias path some clients may probe: append /sse
+            parent_app.add_route(
+                "/.well-known/oauth-protected-resource/sse", well_known_protected_resource, methods=["GET"]
             )
 
             # Compatibility: some clients probe these endpoints on the resource host
