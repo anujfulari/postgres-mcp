@@ -12,11 +12,12 @@ from typing import Dict
 from typing import Optional
 
 from fastapi import FastAPI
-from fastapi import Form
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from jose import jwt
 from pydantic import BaseModel
+from starlette.requests import Request
+from urllib.parse import parse_qs
 
 try:
     from cryptography.hazmat.primitives.asymmetric import rsa
@@ -110,14 +111,32 @@ class EmbeddedOAuthServer:
             return {"keys": [self._jwk]}
 
         @self._app.post("/oauth/token", response_model=TokenResponse)
-        async def token(
-            grant_type: str = Form(...),
-            client_id: str = Form(...),
-            client_secret: str = Form(...),
-            scope: Optional[str] = Form(None),
-        ) -> Any:
+        async def token(request: Request) -> Any:
+            # Manually parse application/x-www-form-urlencoded or JSON to avoid python-multipart dependency
+            content_type = request.headers.get("content-type", "")
+            raw_body = await request.body()
+            params: Dict[str, str] = {}
+            if "application/x-www-form-urlencoded" in content_type:
+                parsed = parse_qs(raw_body.decode("utf-8"), keep_blank_values=True)
+                params = {k: v[0] for k, v in parsed.items() if isinstance(v, list) and len(v) > 0}
+            else:
+                try:
+                    data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+                    if isinstance(data, dict):
+                        params = {k: str(v) for k, v in data.items()}
+                except Exception:
+                    params = {}
+
+            grant_type = params.get("grant_type")
+            client_id = params.get("client_id")
+            client_secret = params.get("client_secret")
+            scope = params.get("scope")
+
             if grant_type != "client_credentials":
                 raise HTTPException(status_code=400, detail="unsupported_grant_type")
+
+            if not client_id or not client_secret:
+                raise HTTPException(status_code=400, detail="invalid_client")
 
             client = self._clients.get(client_id)
             if not client or client.client_secret != client_secret:
