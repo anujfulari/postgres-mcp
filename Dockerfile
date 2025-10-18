@@ -15,7 +15,7 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-  uv sync --no-dev
+  uv sync --no-install-project --no-dev
 ADD . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
   uv sync --no-dev
