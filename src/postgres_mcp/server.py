@@ -848,13 +848,31 @@ async def main():
                         logger.warning(f"Failed to fetch JWKS from issuer: {e}")
                         return JSONResponse({"error": "jwks_fetch_failed"}, status_code=502)
 
+                async def _protected_resource(request: Request):
+                    # Minimal OAuth 2.0 Protected Resource Metadata
+                    try:
+                        base = str(request.base_url).rstrip("/")
+                    except Exception:
+                        base = ""
+                    doc: dict[str, Any] = {
+                        "authorization_servers": [authn.config.oauth_issuer] if authn.config.oauth_issuer else [],
+                    }
+                    if base:
+                        doc["resource"] = base
+                    return JSONResponse(doc)
+
                 # Register both root and /sse path variants to accommodate reverse proxies
                 app.add_route("/.well-known/openid-configuration", _openid_config, methods=["GET"])  # type: ignore[arg-type]
                 app.add_route("/.well-known/oauth-authorization-server", _rfc8414_config, methods=["GET"])  # type: ignore[arg-type]
                 app.add_route("/.well-known/jwks.json", _jwks_proxy, methods=["GET"])  # type: ignore[arg-type]
+                app.add_route("/.well-known/openid-configuration/sse", _openid_config, methods=["GET"])  # type: ignore[arg-type]
+                app.add_route("/.well-known/oauth-authorization-server/sse", _rfc8414_config, methods=["GET"])  # type: ignore[arg-type]
+                app.add_route("/.well-known/oauth-protected-resource", _protected_resource, methods=["GET"])  # type: ignore[arg-type]
+                app.add_route("/.well-known/oauth-protected-resource/sse", _protected_resource, methods=["GET"])  # type: ignore[arg-type]
                 app.add_route("/sse/.well-known/openid-configuration", _openid_config, methods=["GET"])  # type: ignore[arg-type]
                 app.add_route("/sse/.well-known/oauth-authorization-server", _rfc8414_config, methods=["GET"])  # type: ignore[arg-type]
                 app.add_route("/sse/.well-known/jwks.json", _jwks_proxy, methods=["GET"])  # type: ignore[arg-type]
+                app.add_route("/sse/.well-known/oauth-protected-resource", _protected_resource, methods=["GET"])  # type: ignore[arg-type]
 
                 config = uvicorn.Config(
                     app,
