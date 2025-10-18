@@ -81,7 +81,7 @@ def create_authenticated_mcp() -> FastMCP:
     authenticated_mcp = FastMCP("postgres-mcp")
     
     # Add all the tools from the original mcp instance
-    for tool_name, tool_func in mcp._tools.items():
+    for tool_name, tool_func in mcp._tool_manager._tools.items():
         authenticated_mcp.add_tool(tool_func, description=getattr(tool_func, '__doc__', ''))
     
     # Override the SSE handler to include authentication
