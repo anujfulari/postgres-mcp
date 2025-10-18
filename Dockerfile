@@ -16,10 +16,10 @@ RUN apt-get update \
 RUN --mount=type=cache,target=/root/.cache/uv \
   --mount=type=bind,source=uv.lock,target=uv.lock \
   --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-  uv sync --frozen --no-install-project --no-dev
+  uv sync --no-install-project --no-dev
 ADD . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
-  uv sync --frozen --no-dev
+  uv sync --no-dev
 
 
 FROM python:3.12-slim-bookworm
