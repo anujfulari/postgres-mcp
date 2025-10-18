@@ -702,45 +702,39 @@ async def main():
         # For SSE transport, use the authenticated MCP instance
         authenticated_mcp = create_authenticated_mcp()
 
-        # Attach auth middleware when possible so Authorization header is enforced
-        try:
-            fastapi_app = getattr(authenticated_mcp, "app", None)
-            middleware_attached = False
-            if (
-                authenticator
-                and not authenticator.config.disable_auth
-                and fastapi_app is not None
-                and hasattr(fastapi_app, "add_middleware")
-                and callable(getattr(fastapi_app, "add_middleware", None))
-            ):
-                fastapi_app.add_middleware(AuthMiddleware, authenticator=authenticator)
-                logger.info("SSE authentication middleware attached (Authorization: Bearer <api-key>)")
-                middleware_attached = True
-            else:
-                # Best-effort notice if we cannot attach middleware due to FastMCP API differences
-                if authenticator and not authenticator.config.disable_auth:
-                    logger.warning(
-                        "SSE auth is enabled but middleware could not be attached. Ensure clients send Authorization headers."
-                    )
-        except Exception as e:
-            logger.warning(f"Unable to attach SSE auth middleware: {e}")
-            middleware_attached = False
-
-        # If auth is required and we couldn't attach middleware, fail fast unless explicitly allowed
-        if (
-            authenticator
-            and not authenticator.config.disable_auth
-            and not middleware_attached
-            and not args.allow_insecure_sse
-        ):
-            logger.error(
-                "Refusing to start SSE without enforced auth. Upgrade FastMCP (app middleware support) or run behind a proxy, "
-                "or pass --allow-insecure-sse to override (NOT recommended)."
-            )
-            sys.exit(1)
-
         authenticated_mcp.settings.host = args.sse_host
         authenticated_mcp.settings.port = args.sse_port
+
+        # If auth is enabled, build the Starlette app explicitly, inject middleware, and run uvicorn
+        if authenticator and not authenticator.config.disable_auth:
+            try:
+                import uvicorn
+
+                app = authenticated_mcp.sse_app()
+                # Enforce Authorization header via middleware
+                app.add_middleware(AuthMiddleware, authenticator=authenticator)
+                logger.info("SSE authentication middleware attached (Authorization: Bearer <api-key>)")
+
+                config = uvicorn.Config(
+                    app,
+                    host=authenticated_mcp.settings.host,
+                    port=authenticated_mcp.settings.port,
+                    log_level=authenticated_mcp.settings.log_level.lower(),
+                )
+                server = uvicorn.Server(config)
+                await server.serve()
+                return
+            except Exception as e:
+                logger.error(f"Failed to start SSE with enforced auth: {e}")
+                if not args.allow_insecure_sse:
+                    logger.error(
+                        "Refusing to start SSE without enforced auth. Run behind a proxy or pass --allow-insecure-sse to override (NOT recommended)."
+                    )
+                    sys.exit(1)
+                else:
+                    logger.warning("Proceeding with insecure SSE due to --allow-insecure-sse")
+
+        # Auth disabled or insecure override requested: fall back to FastMCP's default runner
         await authenticated_mcp.run_sse_async()
 
 
