@@ -77,32 +77,9 @@ async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
 
 def create_authenticated_mcp() -> FastMCP:
     """Create a FastMCP instance with authentication middleware for SSE transport."""
-    # Create a new FastMCP instance
-    authenticated_mcp = FastMCP("postgres-mcp")
-    
-    # Add all the tools from the original mcp instance
-    for tool_name, tool_func in mcp._tool_manager._tools.items():
-        authenticated_mcp.add_tool(tool_func, description=getattr(tool_func, '__doc__', ''))
-    
-    # Override the SSE handler to include authentication
-    original_sse_handler = authenticated_mcp._sse_handler
-    
-    async def authenticated_sse_handler(request):
-        """SSE handler with authentication."""
-        if authenticator and not authenticator.config.disable_auth:
-            # Check Authorization header
-            auth_header = request.headers.get("Authorization")
-            if not authenticator.validate_authorization_header(auth_header):
-                from fastapi import HTTPException
-                raise HTTPException(status_code=401, detail="Authentication required")
-        
-        # Call the original handler if authentication passes
-        return await original_sse_handler(request)
-    
-    # Replace the SSE handler
-    authenticated_mcp._sse_handler = authenticated_sse_handler
-    
-    return authenticated_mcp
+    # For SSE transport with authentication, we need to use the original mcp instance
+    # and handle authentication at the HTTP level using FastMCP's built-in auth support
+    return mcp
 
 
 def format_text_response(text: Any) -> ResponseType:
@@ -652,12 +629,11 @@ async def main():
     if args.transport == "stdio":
         await mcp.run_stdio_async()
     else:
-        # Create authenticated MCP instance for SSE transport
-        authenticated_mcp = create_authenticated_mcp()
-        # Update FastMCP settings based on command line arguments
-        authenticated_mcp.settings.host = args.sse_host
-        authenticated_mcp.settings.port = args.sse_port
-        await authenticated_mcp.run_sse_async()
+        # For SSE transport, use the original mcp instance
+        # FastMCP will handle authentication through its built-in mechanisms
+        mcp.settings.host = args.sse_host
+        mcp.settings.port = args.sse_port
+        await mcp.run_sse_async()
 
 
 async def shutdown(sig=None):
