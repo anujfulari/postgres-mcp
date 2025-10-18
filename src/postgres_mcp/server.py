@@ -79,7 +79,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             logger.warning(f"Authentication failed for request to {request.url.path}")
             return JSONResponse(
                 status_code=401,
-                content={"error": "Authentication required", "detail": "Invalid or missing API key"}
+                content={"error": "Authentication required", "detail": "Invalid or missing access token"}
             )
         
         # Authentication successful, proceed with the request
@@ -611,9 +611,34 @@ async def main():
         help="Port for SSE server (default: 8000)",
     )
     parser.add_argument(
-        "--api-key",
+        "--oauth-issuer",
         type=str,
-        help="API key for authentication (can also be set via MCP_API_KEY environment variable)",
+        help="OAuth issuer (can also be set via OAUTH_ISSUER)",
+    )
+    parser.add_argument(
+        "--oauth-audience",
+        type=str,
+        help="OAuth audience (can also be set via OAUTH_AUDIENCE)",
+    )
+    parser.add_argument(
+        "--oauth-jwks-url",
+        type=str,
+        help="OAuth JWKS URL (can also be set via OAUTH_JWKS_URL)",
+    )
+    parser.add_argument(
+        "--oauth-algorithms",
+        type=str,
+        help="Comma-separated list of allowed JWT algorithms (also OAUTH_ALGORITHMS)",
+    )
+    parser.add_argument(
+        "--oauth-required-scopes",
+        type=str,
+        help="Comma-separated list of required scopes (also OAUTH_REQUIRED_SCOPES)",
+    )
+    parser.add_argument(
+        "--oauth-hs256-secret",
+        type=str,
+        help="HS256 secret for symmetric validation (testing). Also OAUTH_HS256_SECRET",
     )
     parser.add_argument(
         "--disable-auth",
@@ -632,7 +657,12 @@ async def main():
     global authenticator
     try:
         auth_config = AuthConfig.from_env_and_args(
-            api_key_arg=args.api_key,
+            oauth_issuer_arg=args.oauth_issuer,
+            oauth_audience_arg=args.oauth_audience,
+            oauth_jwks_url_arg=args.oauth_jwks_url,
+            oauth_algorithms_arg=args.oauth_algorithms,
+            oauth_required_scopes_arg=args.oauth_required_scopes,
+            oauth_hs256_secret_arg=args.oauth_hs256_secret,
             disable_auth_arg=args.disable_auth,
         )
         authenticator = Authenticator(auth_config)
@@ -640,8 +670,8 @@ async def main():
         
         # For SSE transport, we'll use a custom authentication approach
         if args.transport == "sse" and not auth_config.disable_auth:
-            logger.info("SSE transport with API key authentication configured")
-            logger.warning("Note: SSE authentication requires proper client configuration")
+            logger.info("SSE transport with OAuth2 authentication configured")
+            logger.warning("Note: SSE authentication requires clients to send 'Authorization: Bearer <token>'")
             
     except AuthError as e:
         logger.error(f"Authentication setup failed: {e}")
@@ -662,7 +692,7 @@ async def main():
     # For stdio transport, validate authentication at startup
     if args.transport == "stdio" and authenticator and not authenticator.config.disable_auth:
         logger.info("Authentication is enabled for stdio transport")
-        logger.info("Clients must provide a valid API key via MCP_API_KEY environment variable")
+        logger.info("Clients must provide a valid OAuth2 token when connecting (Bearer token)")
 
     # Get database URL from environment variable or command line
     database_url = os.environ.get("DATABASE_URI", args.database_url)
@@ -713,7 +743,7 @@ async def main():
                 app = authenticated_mcp.sse_app()
                 # Enforce Authorization header via middleware
                 app.add_middleware(AuthMiddleware, authenticator=authenticator)
-                logger.info("SSE authentication middleware attached (Authorization: Bearer <api-key>)")
+                logger.info("SSE authentication middleware attached (Authorization: Bearer <access-token>)")
 
                 config = uvicorn.Config(
                     app,

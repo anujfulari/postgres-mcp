@@ -214,35 +214,41 @@ To use restricted mode, replace `--access-mode=unrestricted` with `--access-mode
 
 ##### Authentication
 
-Postgres MCP Pro requires API key authentication by default to ensure only authorized clients can access the server. You can provide the API key in several ways:
+Postgres MCP Pro now uses OAuth2 Bearer token (JWT) authentication. Configure the server with your OAuth provider details via environment variables or CLI flags. When enabled, clients must send an `Authorization: Bearer <access-token>` header.
 
-**Option 1: Environment Variable (Recommended)**
+Required configuration when auth is enabled:
+- `OAUTH_ISSUER`: Expected token issuer (e.g., `https://login.example.com`)
+- `OAUTH_AUDIENCE`: Expected audience configured for this service
+- One of:
+  - `OAUTH_JWKS_URL`: JWKS endpoint for public keys (e.g., `https://login.example.com/.well-known/jwks.json`)
+  - `OAUTH_HS256_SECRET`: HS256 secret for symmetric validation (testing/simple setups)
+
+Optional:
+- `OAUTH_ALGORITHMS`: Comma-separated allowed algorithms (default: `RS256,HS256`)
+- `OAUTH_REQUIRED_SCOPES`: Comma-separated scopes that must be present on the token
+
+Examples:
 ```bash
-export MCP_API_KEY="your-secure-api-key-here"
+export OAUTH_ISSUER="https://login.example.com"
+export OAUTH_AUDIENCE="postgres-mcp"
+export OAUTH_JWKS_URL="https://login.example.com/.well-known/jwks.json"
+# Optional
+export OAUTH_REQUIRED_SCOPES="db.read,db.tune"
 ```
 
-**Option 2: Command Line Argument**
+Or for testing with HS256:
 ```bash
-postgres-mcp --api-key "your-secure-api-key-here"
+export OAUTH_ISSUER="local"
+export OAUTH_AUDIENCE="postgres-mcp"
+export OAUTH_HS256_SECRET="replace-with-a-strong-secret"
 ```
 
-**Option 3: Generate a New API Key**
-```python
-from postgres_mcp.auth import generate_api_key
-print(generate_api_key())  # Generates a secure 32-byte key
-```
+Note: For HS256 mode, `OAUTH_ISSUER` is optional. If omitted, the server will not verify the `iss` claim, but it will still verify the signature and `aud` (if provided).
 
-**Disable Authentication (Not Recommended for Production)**
+Disable Authentication (not recommended for production):
 ```bash
 postgres-mcp --disable-auth
 ```
-
-**For SSE Transport**: Clients must include the API key in the `Authorization` header:
-```
-Authorization: Bearer your-secure-api-key-here
-```
-
-**For stdio Transport**: The API key is validated at server startup. Clients must ensure the server has access to the correct API key via environment variables.
 
 
 #### Other MCP Clients
@@ -263,7 +269,9 @@ For example, with Docker run:
 ```bash
 docker run -p 8000:8000 \
   -e DATABASE_URI=postgresql://username:password@localhost:5432/dbname \
-  -e MCP_API_KEY=your-secure-api-key-here \
+  -e OAUTH_ISSUER=https://login.example.com \
+  -e OAUTH_AUDIENCE=postgres-mcp \
+  -e OAUTH_JWKS_URL=https://login.example.com/.well-known/jwks.json \
   crystaldba/postgres-mcp --access-mode=unrestricted --transport=sse
 ```
 
@@ -277,7 +285,7 @@ For example, in Cursor's `mcp.json` or Cline's `cline_mcp_settings.json` you can
             "type": "sse",
             "url": "http://localhost:8000/sse",
             "headers": {
-                "Authorization": "Bearer your-secure-api-key-here"
+                "Authorization": "Bearer YOUR_OAUTH_ACCESS_TOKEN"
             }
         }
     }
@@ -293,7 +301,7 @@ For Windsurf, the format in `mcp_config.json` is slightly different:
             "type": "sse",
             "serverUrl": "http://localhost:8000/sse",
             "headers": {
-                "Authorization": "Bearer your-secure-api-key-here"
+                "Authorization": "Bearer YOUR_OAUTH_ACCESS_TOKEN"
             }
         }
     }

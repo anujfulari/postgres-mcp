@@ -9,6 +9,10 @@ psycopg-pool>=3.2.6
 # HTTP framework for SSE transport authentication
 fastapi>=0.104.0
 
+# OAuth / JWT validation
+python-jose[cryptography]>=3.3.0
+requests>=2.32.0
+
 # PostgreSQL parsing and analysis
 pglast==7.2.0
 
