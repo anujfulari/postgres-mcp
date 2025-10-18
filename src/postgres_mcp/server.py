@@ -21,6 +21,7 @@ from pydantic import validate_call
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.responses import RedirectResponse
 from starlette.applications import Starlette
 
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
@@ -761,6 +762,20 @@ async def main():
 
             parent_app.add_route(
                 "/.well-known/oauth-protected-resource", well_known_protected_resource, methods=["GET"]
+            )
+
+            # Compatibility: some clients probe these endpoints on the resource host
+            def well_known_openid_configuration(request: Request):
+                return RedirectResponse(url=STYTCH_OIDC, status_code=307)
+
+            def well_known_oauth_authorization_server(request: Request):
+                return RedirectResponse(url=STYTCH_OIDC, status_code=307)
+
+            parent_app.add_route(
+                "/.well-known/openid-configuration", well_known_openid_configuration, methods=["GET"]
+            )
+            parent_app.add_route(
+                "/.well-known/oauth-authorization-server", well_known_oauth_authorization_server, methods=["GET"]
             )
 
             # Attach OAuth middleware
