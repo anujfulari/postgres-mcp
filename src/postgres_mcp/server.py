@@ -1,10 +1,12 @@
 # ruff: noqa: B008
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
 import sys
+import time
 from enum import Enum
 from typing import Any
 from typing import List
@@ -19,14 +21,12 @@ from pydantic import validate_call
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.applications import Starlette
 
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 
 from .artifacts import ErrorResult
 from .artifacts import ExplainPlanArtifact
-from .auth import AuthConfig
-from .auth import Authenticator
-from .auth import AuthError
 from .database_health import DatabaseHealthTool
 from .database_health import HealthType
 from .explain import ExplainPlanTool
@@ -40,6 +40,11 @@ from .sql import check_hypopg_installation_status
 from .sql import obfuscate_password
 from .top_queries import TopQueriesCalc
 
+# OAuth / Stytch verification
+import httpx
+import jwt
+from jwt import algorithms
+
 # Initialize FastMCP with default settings
 mcp = FastMCP("postgres-mcp")
 
@@ -51,38 +56,91 @@ ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResou
 
 logger = logging.getLogger(__name__)
 
+# ==========================
+# Stytch OAuth configuration
+# ==========================
+
+STYTCH_OIDC = os.environ.get(
+    "STYTCH_OIDC",
+    "https://api.stytch.com/v1/public/oauth/.well-known/openid-configuration",
+)
+
+# Audience/resource identifier consumed by tokens issued by Stytch
+REQUIRED_AUDIENCE = os.environ.get("MCP_OAUTH_AUDIENCE", "mcp://mcp.otelai.com")
+
+# Allow disabling auth for local dev/tests
+DISABLE_AUTH = os.environ.get("DISABLE_AUTH", "0") in ("1", "true", "True")
+
+_jwks_cache: dict[str, Any] = {}
+_jwks_expiration_ts: float = 0.0
+_issuer_value: Optional[str] = None
 
 
+async def _fetch_stytch_jwks() -> dict[str, Any]:
+    """Fetch and cache JWKS from Stytch, refreshing periodically."""
+    global _jwks_cache, _jwks_expiration_ts
+    now = time.time()
+    # Refresh every 10 minutes
+    if _jwks_cache and now < _jwks_expiration_ts:
+        return _jwks_cache
 
-class AuthMiddleware(BaseHTTPMiddleware):
-    """Custom authentication middleware for FastMCP SSE transport."""
-    
-    def __init__(self, app, authenticator: Optional[Authenticator] = None):
-        super().__init__(app)
-        self.authenticator = authenticator
-    
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(STYTCH_OIDC)
+        resp.raise_for_status()
+        conf = resp.json()
+        jwks_uri = conf["jwks_uri"]
+        # cache issuer from OIDC metadata to avoid hardcoding
+        global _issuer_value
+        _issuer_value = conf.get("issuer", "https://api.stytch.com")
+        jwks_resp = await client.get(jwks_uri)
+        jwks_resp.raise_for_status()
+        _jwks_cache = jwks_resp.json()
+        # Cache for 10 minutes
+        _jwks_expiration_ts = now + 600
+    return _jwks_cache
+
+
+def _verify_stytch_token(token: str, jwks: dict[str, Any], issuer: str) -> dict[str, Any]:
+    """Verify a JWT issued by Stytch and return its claims."""
+    header = jwt.get_unverified_header(token)
+    key = next((k for k in jwks.get("keys", []) if k.get("kid") == header.get("kid")), None)
+    if not key:
+        raise jwt.InvalidKeyError("Signing key not found for token")
+    public_key = algorithms.RSAAlgorithm.from_jwk(json.dumps(key))
+    claims = jwt.decode(
+        token,
+        public_key,
+        algorithms=["RS256"],
+        audience=REQUIRED_AUDIENCE,
+        issuer=issuer,
+    )
+    return claims
+
+
+class StytchAuthMiddleware(BaseHTTPMiddleware):
+    """OAuth (Stytch) authentication middleware for all HTTP requests."""
+
     async def dispatch(self, request: Request, call_next):
-        """Check authentication for incoming requests."""
-        # Skip authentication for health checks and static files
-        if request.url.path in ["/health", "/favicon.ico"]:
+        # Allow health and well-known endpoints without auth
+        if request.url.path in ["/health", "/favicon.ico"] or request.url.path.startswith("/.well-known/"):
             return await call_next(request)
-        
-        # Check if authentication is disabled
-        if not self.authenticator or self.authenticator.config.disable_auth:
+
+        if DISABLE_AUTH:
             return await call_next(request)
-        
-        # Get the Authorization header
+
         auth_header = request.headers.get("Authorization")
-        
-        # Validate the bearer token
-        if not self.authenticator.validate_authorization_header(auth_header):
-            logger.warning(f"Authentication failed for request to {request.url.path}")
-            return JSONResponse(
-                status_code=401,
-                content={"error": "Authentication required", "detail": "Invalid or missing API key"}
-            )
-        
-        # Authentication successful, proceed with the request
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return JSONResponse(status_code=401, content={"error": "Missing token"})
+
+        token = auth_header.split(" ", 1)[1]
+        try:
+            jwks = await _fetch_stytch_jwks()
+            issuer = _issuer_value or "https://api.stytch.com"
+            _verify_stytch_token(token, jwks, issuer)
+        except Exception as e:
+            logger.warning(f"Token verification failed: {e}")
+            return JSONResponse(status_code=401, content={"error": "Invalid token"})
+
         return await call_next(request)
 
 
@@ -97,7 +155,6 @@ class AccessMode(str, Enum):
 db_connection = DbConnPool()
 current_access_mode = AccessMode.UNRESTRICTED
 shutdown_in_progress = False
-authenticator: Optional[Authenticator] = None
 
 
 async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
@@ -116,7 +173,7 @@ def create_authenticated_mcp() -> FastMCP:
     """Create a FastMCP instance with authentication for SSE transport."""
     # Create FastMCP instance
     authenticated_mcp = FastMCP("postgres-mcp")
-    logger.info("FastMCP instance created with authentication")
+    logger.info("FastMCP instance created")
     
     # Copy all tools from the original mcp instance
     authenticated_mcp.add_tool(list_schemas, description="List all schemas in the database")
@@ -611,14 +668,9 @@ async def main():
         help="Port for SSE server (default: 8000)",
     )
     parser.add_argument(
-        "--api-key",
-        type=str,
-        help="API key for authentication (can also be set via MCP_API_KEY environment variable)",
-    )
-    parser.add_argument(
         "--disable-auth",
         action="store_true",
-        help="Disable authentication (not recommended for production)",
+        help="Disable OAuth authentication (not recommended for production)",
     )
     parser.add_argument(
         "--allow-insecure-sse",
@@ -628,24 +680,11 @@ async def main():
 
     args = parser.parse_args()
 
-    # Initialize authentication
-    global authenticator
-    try:
-        auth_config = AuthConfig.from_env_and_args(
-            api_key_arg=args.api_key,
-            disable_auth_arg=args.disable_auth,
-        )
-        authenticator = Authenticator(auth_config)
-        logger.info("Authentication initialized successfully")
-        
-        # For SSE transport, we'll use a custom authentication approach
-        if args.transport == "sse" and not auth_config.disable_auth:
-            logger.info("SSE transport with API key authentication configured")
-            logger.warning("Note: SSE authentication requires proper client configuration")
-            
-    except AuthError as e:
-        logger.error(f"Authentication setup failed: {e}")
-        sys.exit(1)
+    # Configure auth disable flag for middleware
+    global DISABLE_AUTH
+    if args.disable_auth:
+        DISABLE_AUTH = True
+        logger.warning("OAuth authentication is DISABLED. Not recommended for production.")
 
     # Store the access mode in the global variable
     global current_access_mode
@@ -659,10 +698,9 @@ async def main():
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
     
-    # For stdio transport, validate authentication at startup
-    if args.transport == "stdio" and authenticator and not authenticator.config.disable_auth:
-        logger.info("Authentication is enabled for stdio transport")
-        logger.info("Clients must provide a valid API key via MCP_API_KEY environment variable")
+    # For stdio transport, no HTTP auth is involved
+    if args.transport == "stdio":
+        logger.info("Starting with stdio transport (no HTTP auth applicable)")
 
     # Get database URL from environment variable or command line
     database_url = os.environ.get("DATABASE_URI", args.database_url)
@@ -699,43 +737,57 @@ async def main():
     if args.transport == "stdio":
         await mcp.run_stdio_async()
     else:
-        # For SSE transport, use the authenticated MCP instance
+        # For SSE transport, build the FastAPI app with OAuth middleware and well-known endpoint
         authenticated_mcp = create_authenticated_mcp()
 
         authenticated_mcp.settings.host = args.sse_host
         authenticated_mcp.settings.port = args.sse_port
 
-        # If auth is enabled, build the Starlette app explicitly, inject middleware, and run uvicorn
-        if authenticator and not authenticator.config.disable_auth:
-            try:
-                import uvicorn
+        try:
+            import uvicorn
 
-                app = authenticated_mcp.sse_app()
-                # Enforce Authorization header via middleware
-                app.add_middleware(AuthMiddleware, authenticator=authenticator)
-                logger.info("SSE authentication middleware attached (Authorization: Bearer <api-key>)")
+            sse_sub_app = authenticated_mcp.sse_app()
 
-                config = uvicorn.Config(
-                    app,
-                    host=authenticated_mcp.settings.host,
-                    port=authenticated_mcp.settings.port,
-                    log_level=authenticated_mcp.settings.log_level.lower(),
+            # Parent Starlette app to host well-known endpoint and enforce auth
+            parent_app = Starlette()
+
+            def well_known_protected_resource(request: Request):
+                return JSONResponse(
+                    {
+                        "authorization_servers": [STYTCH_OIDC],
+                        "resource": REQUIRED_AUDIENCE,
+                    }
                 )
-                server = uvicorn.Server(config)
-                await server.serve()
-                return
-            except Exception as e:
-                logger.error(f"Failed to start SSE with enforced auth: {e}")
-                if not args.allow_insecure_sse:
-                    logger.error(
-                        "Refusing to start SSE without enforced auth. Run behind a proxy or pass --allow-insecure-sse to override (NOT recommended)."
-                    )
-                    sys.exit(1)
-                else:
-                    logger.warning("Proceeding with insecure SSE due to --allow-insecure-sse")
 
-        # Auth disabled or insecure override requested: fall back to FastMCP's default runner
-        await authenticated_mcp.run_sse_async()
+            parent_app.add_route(
+                "/.well-known/oauth-protected-resource", well_known_protected_resource, methods=["GET"]
+            )
+
+            # Attach OAuth middleware
+            parent_app.add_middleware(StytchAuthMiddleware)
+
+            # Mount SSE app at root (it serves /sse)
+            parent_app.mount("/", sse_sub_app)
+
+            config = uvicorn.Config(
+                parent_app,
+                host=authenticated_mcp.settings.host,
+                port=authenticated_mcp.settings.port,
+                log_level=authenticated_mcp.settings.log_level.lower(),
+            )
+            server = uvicorn.Server(config)
+            await server.serve()
+            return
+        except Exception as e:
+            logger.error(f"Failed to start SSE app: {e}")
+            if not args.allow_insecure_sse:
+                logger.error(
+                    "Refusing to start SSE without enforced auth. Run behind a proxy or pass --allow-insecure-sse to override (NOT recommended)."
+                )
+                sys.exit(1)
+            else:
+                logger.warning("Proceeding with insecure SSE due to --allow-insecure-sse")
+                await authenticated_mcp.run_sse_async()
 
 
 async def shutdown(sig=None):
