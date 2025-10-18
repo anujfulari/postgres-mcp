@@ -64,7 +64,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         """Check authentication for incoming requests."""
         # Skip authentication for health checks and static files
-        if request.url.path in ["/health", "/favicon.ico"]:
+        if request.url.path in ["/health", "/favicon.ico"] or request.url.path.startswith("/.well-known/"):
             return await call_next(request)
         
         # Check if authentication is disabled
@@ -75,7 +75,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
         auth_header = request.headers.get("Authorization")
         
         # Validate the bearer token
-        if not self.authenticator.validate_authorization_header(auth_header):
+        # Prefer async validation to support OIDC flows
+        is_valid = await self.authenticator.validate_authorization_header_async(auth_header)
+        if not is_valid and not self.authenticator.validate_authorization_header(auth_header):
             logger.warning(f"Authentication failed for request to {request.url.path}")
             return JSONResponse(
                 status_code=401,
@@ -714,6 +716,25 @@ async def main():
                 # Enforce Authorization header via middleware
                 app.add_middleware(AuthMiddleware, authenticator=authenticator)
                 logger.info("SSE authentication middleware attached (Authorization: Bearer <api-key>)")
+                
+                # Add well-known OAuth protected resource metadata endpoint
+                async def oauth_resource_meta(request: Request):
+                    return JSONResponse(
+                        {
+                            "authorization_servers": [authenticator.config.google_oidc_config_url],
+                            "resource": "mcp://postgres-mcp",
+                        }
+                    )
+                
+                try:
+                    app.add_route(
+                        "/.well-known/oauth-protected-resource",
+                        oauth_resource_meta,
+                        methods=["GET"],
+                    )
+                except Exception:
+                    # Fallback for apps that might not support add_route (should not happen with Starlette/FastAPI)
+                    pass
 
                 config = uvicorn.Config(
                     app,

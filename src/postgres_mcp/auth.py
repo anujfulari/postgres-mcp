@@ -1,7 +1,12 @@
 """Authorization module for PostgreSQL MCP Server.
 
-This module provides API key-based authentication for the MCP server.
-It supports secure key validation with timing-attack resistance.
+This module provides authentication for the MCP server.
+It supports:
+- API key-based authentication (default)
+- Optional Google OAuth (OIDC) ID token verification when configured
+
+API key validation is synchronous and timing-attack resistant.
+OIDC token validation uses Google's JWKS and requires network access.
 """
 
 import hashlib
@@ -9,7 +14,11 @@ import hmac
 import logging
 import os
 import secrets
-from typing import Optional
+import time
+from typing import Optional, Any
+
+import jwt  # pyjwt  # type: ignore[import-not-found]
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -27,15 +36,24 @@ class AuthConfig:
         self,
         api_key: Optional[str] = None,
         disable_auth: bool = False,
+        google_client_id: Optional[str] = None,
+        google_oidc_config_url: str = "https://accounts.google.com/.well-known/openid-configuration",
+        workspace_domain: Optional[str] = None,
     ):
         """Initialize authentication configuration.
 
         Args:
             api_key: The API key to use for authentication
             disable_auth: Whether to disable authentication (for testing/development)
+            google_client_id: Google OAuth Client ID to enable OIDC verification
+            google_oidc_config_url: OIDC discovery URL for the identity provider
+            workspace_domain: Optional Google Workspace domain restriction (claims.hd)
         """
         self.api_key = api_key
         self.disable_auth = disable_auth
+        self.google_client_id = google_client_id
+        self.google_oidc_config_url = google_oidc_config_url
+        self.workspace_domain = workspace_domain
 
     @classmethod
     def from_env_and_args(
@@ -59,18 +77,35 @@ class AuthConfig:
         api_key = api_key_arg or os.environ.get("MCP_API_KEY")
         disable_auth = disable_auth_arg
 
-        if not api_key and not disable_auth:
+        # OAuth-related env vars
+        google_client_id = os.environ.get("GOOGLE_CLIENT_ID")
+        google_oidc_config_url = os.environ.get(
+            "GOOGLE_OIDC",
+            "https://accounts.google.com/.well-known/openid-configuration",
+        )
+        workspace_domain = os.environ.get("WORKSPACE_DOMAIN")
+
+        if not api_key and not disable_auth and not google_client_id:
             raise AuthError(
-                "Authentication is required. Please provide an API key via:\n"
-                "  - Command line: --api-key <key>\n"
-                "  - Environment variable: MCP_API_KEY=<key>\n"
-                "  - Or disable auth with: --disable-auth (not recommended for production)"
+                "Authentication is required. Please provide either: \n"
+                "  - API key via --api-key or MCP_API_KEY env var, or\n"
+                "  - Google OAuth by setting GOOGLE_CLIENT_ID (and optional GOOGLE_OIDC, WORKSPACE_DOMAIN), or\n"
+                "  - Disable auth with --disable-auth (NOT recommended)."
             )
 
         if disable_auth:
             logger.warning("Authentication is DISABLED. This is not recommended for production use.")
 
-        return cls(api_key=api_key, disable_auth=disable_auth)
+        if google_client_id:
+            logger.info("Google OAuth (OIDC) verification enabled via GOOGLE_CLIENT_ID")
+
+        return cls(
+            api_key=api_key,
+            disable_auth=disable_auth,
+            google_client_id=google_client_id,
+            google_oidc_config_url=google_oidc_config_url,
+            workspace_domain=workspace_domain,
+        )
 
 
 def generate_api_key(length: int = 32) -> str:
@@ -110,6 +145,9 @@ class Authenticator:
             config: Authentication configuration
         """
         self.config = config
+        self._jwks_cache: dict[str, object] = {}
+        self._jwks_fetched_at: float = 0.0
+        self._jwks_cache_ttl_seconds: int = 3600
 
     def is_authenticated(self, provided_key: Optional[str]) -> bool:
         """Check if the provided API key is valid.
@@ -137,6 +175,43 @@ class Authenticator:
 
         return is_valid
 
+    async def _get_google_jwks(self) -> dict[str, Any]:
+        """Fetch and cache JWKS from the configured OIDC discovery document."""
+        now = time.time()
+        if self._jwks_cache and (now - self._jwks_fetched_at) < self._jwks_cache_ttl_seconds:
+            return self._jwks_cache["jwks"]  # type: ignore[index]
+
+        oidc_url = self.config.google_oidc_config_url
+        async with httpx.AsyncClient() as client:
+            oidc = (await client.get(oidc_url)).json()
+            jwks_uri = oidc["jwks_uri"]
+            jwks = (await client.get(jwks_uri)).json()
+
+        self._jwks_cache = {"jwks_uri": jwks_uri, "jwks": jwks}
+        self._jwks_fetched_at = now
+        return jwks
+
+    def _verify_google_id_token(self, id_token: str, jwks: dict[str, Any]) -> bool:
+        """Verify a Google ID token using JWKS and configured client ID/domain."""
+        try:
+            header = jwt.get_unverified_header(id_token)
+            key = next(k for k in jwks["keys"] if k["kid"] == header["kid"])  # type: ignore[index]
+            claims = jwt.decode(
+                id_token,
+                jwt.algorithms.RSAAlgorithm.from_jwk(key),
+                algorithms=["RS256"],
+                audience=self.config.google_client_id,
+                issuer=["https://accounts.google.com", "accounts.google.com"],
+            )
+            workspace_domain = self.config.workspace_domain
+            if workspace_domain and claims.get("hd") != workspace_domain:  # type: ignore[union-attr]
+                logger.warning("OIDC token rejected: hd claim does not match WORKSPACE_DOMAIN")
+                return False
+            return True
+        except Exception as exc:
+            logger.warning(f"OIDC token verification failed: {exc}")
+            return False
+
     def validate_authorization_header(self, auth_header: Optional[str]) -> bool:
         """Validate Authorization header for HTTP requests.
 
@@ -157,8 +232,17 @@ class Authenticator:
             logger.warning("Authentication failed: Invalid Authorization header format")
             return False
 
-        api_key = auth_header[7:]  # Remove "Bearer " prefix
-        return self.is_authenticated(api_key)
+        token = auth_header[7:]
+
+        # If Google OAuth is configured, accept a valid Google ID token
+        if self.config.google_client_id:
+            # Best-effort synchronous heuristic: quickly accept JWT-looking tokens and let async path do network
+            if token.count(".") == 2:
+                # We cannot verify JWKS synchronously here; fall back to False so async path can run
+                return False
+
+        # Fallback to API key validation
+        return self.is_authenticated(token)
 
     def get_auth_required_message(self) -> str:
         """Get the message to display when authentication is required.
@@ -169,5 +253,28 @@ class Authenticator:
         return (
             "Authentication required. Please provide a valid API key via:\n"
             "  - Authorization header: 'Bearer <api-key>'\n"
-            "  - Or set MCP_API_KEY environment variable"
+            "  - Or set MCP_API_KEY environment variable\n"
+            "Alternatively, configure Google OAuth by setting GOOGLE_CLIENT_ID and send a Google ID token."
         )
+
+    async def validate_authorization_header_async(self, auth_header: Optional[str]) -> bool:
+        """Async validation supporting both API key and Google OIDC ID tokens."""
+        if self.config.disable_auth:
+            return True
+
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return False
+
+        token = auth_header[7:]
+
+        # Try Google OIDC first when configured
+        if self.config.google_client_id and token.count(".") == 2:
+            try:
+                jwks = await self._get_google_jwks()
+                if self._verify_google_id_token(token, jwks):
+                    return True
+            except Exception as exc:
+                logger.warning(f"Error during OIDC verification: {exc}")
+
+        # Fallback to API key validation
+        return self.is_authenticated(token)
