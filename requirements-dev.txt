@@ -1,0 +1,14 @@
+# Development dependencies for PostgreSQL MCP Server
+# Include all production requirements
+-r requirements.txt
+
+# Testing framework
+pytest>=8.3.5
+pytest-asyncio>=0.26.0
+
+# Code quality and linting
+ruff==0.11.2
+pyright==1.1.398
+
+# Docker for containerized testing
+docker>=7.1.0

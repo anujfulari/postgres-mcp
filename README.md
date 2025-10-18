@@ -137,11 +137,14 @@ You will now edit the `mcpServers` section of the configuration file.
         "--rm",
         "-e",
         "DATABASE_URI",
+        "-e",
+        "MCP_API_KEY",
         "crystaldba/postgres-mcp",
         "--access-mode=unrestricted"
       ],
       "env": {
-        "DATABASE_URI": "postgresql://username:password@localhost:5432/dbname"
+        "DATABASE_URI": "postgresql://username:password@localhost:5432/dbname",
+        "MCP_API_KEY": "your-secure-api-key-here"
       }
     }
   }
@@ -165,7 +168,8 @@ The Postgres MCP Pro Docker image will automatically remap the hostname `localho
         "--access-mode=unrestricted"
       ],
       "env": {
-        "DATABASE_URI": "postgresql://username:password@localhost:5432/dbname"
+        "DATABASE_URI": "postgresql://username:password@localhost:5432/dbname",
+        "MCP_API_KEY": "your-secure-api-key-here"
       }
     }
   }
@@ -186,7 +190,8 @@ The Postgres MCP Pro Docker image will automatically remap the hostname `localho
         "--access-mode=unrestricted"
       ],
       "env": {
-        "DATABASE_URI": "postgresql://username:password@localhost:5432/dbname"
+        "DATABASE_URI": "postgresql://username:password@localhost:5432/dbname",
+        "MCP_API_KEY": "your-secure-api-key-here"
       }
     }
   }
@@ -207,6 +212,38 @@ Postgres MCP Pro supports multiple *access modes* to give you control over the o
 
 To use restricted mode, replace `--access-mode=unrestricted` with `--access-mode=restricted` in the configuration examples above.
 
+##### Authentication
+
+Postgres MCP Pro requires API key authentication by default to ensure only authorized clients can access the server. You can provide the API key in several ways:
+
+**Option 1: Environment Variable (Recommended)**
+```bash
+export MCP_API_KEY="your-secure-api-key-here"
+```
+
+**Option 2: Command Line Argument**
+```bash
+postgres-mcp --api-key "your-secure-api-key-here"
+```
+
+**Option 3: Generate a New API Key**
+```python
+from postgres_mcp.auth import generate_api_key
+print(generate_api_key())  # Generates a secure 32-byte key
+```
+
+**Disable Authentication (Not Recommended for Production)**
+```bash
+postgres-mcp --disable-auth
+```
+
+**For SSE Transport**: Clients must include the API key in the `Authorization` header:
+```
+Authorization: Bearer your-secure-api-key-here
+```
+
+**For stdio Transport**: The API key is validated at server startup. Clients must ensure the server has access to the correct API key via environment variables.
+
 
 #### Other MCP Clients
 
@@ -226,6 +263,7 @@ For example, with Docker run:
 ```bash
 docker run -p 8000:8000 \
   -e DATABASE_URI=postgresql://username:password@localhost:5432/dbname \
+  -e MCP_API_KEY=your-secure-api-key-here \
   crystaldba/postgres-mcp --access-mode=unrestricted --transport=sse
 ```
 
@@ -237,7 +275,10 @@ For example, in Cursor's `mcp.json` or Cline's `cline_mcp_settings.json` you can
     "mcpServers": {
         "postgres": {
             "type": "sse",
-            "url": "http://localhost:8000/sse"
+            "url": "http://localhost:8000/sse",
+            "headers": {
+                "Authorization": "Bearer your-secure-api-key-here"
+            }
         }
     }
 }
@@ -250,7 +291,10 @@ For Windsurf, the format in `mcp_config.json` is slightly different:
     "mcpServers": {
         "postgres": {
             "type": "sse",
-            "serverUrl": "http://localhost:8000/sse"
+            "serverUrl": "http://localhost:8000/sse",
+            "headers": {
+                "Authorization": "Bearer your-secure-api-key-here"
+            }
         }
     }
 }

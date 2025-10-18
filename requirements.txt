@@ -1,0 +1,26 @@
+# PostgreSQL MCP Server Requirements
+# Core MCP framework
+mcp[cli]>=1.5.0
+
+# Database connectivity
+psycopg[binary]>=3.2.6
+psycopg-pool>=3.2.6
+
+# HTTP framework for SSE transport authentication
+fastapi>=0.104.0
+
+# PostgreSQL parsing and analysis
+pglast==7.2.0
+
+# Data processing and formatting
+humanize>=4.8.0
+attrs>=25.3.0
+
+# LLM integration
+instructor>=1.7.9
+
+# Development dependencies (optional - uncomment for testing)
+# pytest>=8.3.5
+# pytest-asyncio>=0.26.0
+# ruff==0.11.2
+# pyright==1.1.398

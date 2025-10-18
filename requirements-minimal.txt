@@ -1,0 +1,11 @@
+# Minimal requirements for authentication testing
+# Only the essential dependencies for auth module testing
+
+# HTTP framework for SSE transport
+fastapi>=0.104.0
+
+# Core MCP framework (minimal)
+mcp[cli]>=1.5.0
+
+# For testing the auth module in isolation
+# (Note: This won't run the full server without database dependencies)

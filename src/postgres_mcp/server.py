@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Any
 from typing import List
 from typing import Literal
+from typing import Optional
 from typing import Union
 
 import mcp.types as types
@@ -20,6 +21,9 @@ from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 
 from .artifacts import ErrorResult
 from .artifacts import ExplainPlanArtifact
+from .auth import AuthConfig
+from .auth import Authenticator
+from .auth import AuthError
 from .database_health import DatabaseHealthTool
 from .database_health import HealthType
 from .explain import ExplainPlanTool
@@ -56,6 +60,7 @@ class AccessMode(str, Enum):
 db_connection = DbConnPool()
 current_access_mode = AccessMode.UNRESTRICTED
 shutdown_in_progress = False
+authenticator: Optional[Authenticator] = None
 
 
 async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
@@ -68,6 +73,36 @@ async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
     else:
         logger.debug("Using unrestricted SqlDriver (UNRESTRICTED mode)")
         return base_driver
+
+
+def create_authenticated_mcp() -> FastMCP:
+    """Create a FastMCP instance with authentication middleware for SSE transport."""
+    # Create a new FastMCP instance
+    authenticated_mcp = FastMCP("postgres-mcp")
+    
+    # Add all the tools from the original mcp instance
+    for tool_name, tool_func in mcp._tools.items():
+        authenticated_mcp.add_tool(tool_func, description=getattr(tool_func, '__doc__', ''))
+    
+    # Override the SSE handler to include authentication
+    original_sse_handler = authenticated_mcp._sse_handler
+    
+    async def authenticated_sse_handler(request):
+        """SSE handler with authentication."""
+        if authenticator and not authenticator.config.disable_auth:
+            # Check Authorization header
+            auth_header = request.headers.get("Authorization")
+            if not authenticator.validate_authorization_header(auth_header):
+                from fastapi import HTTPException
+                raise HTTPException(status_code=401, detail="Authentication required")
+        
+        # Call the original handler if authentication passes
+        return await original_sse_handler(request)
+    
+    # Replace the SSE handler
+    authenticated_mcp._sse_handler = authenticated_sse_handler
+    
+    return authenticated_mcp
 
 
 def format_text_response(text: Any) -> ResponseType:
@@ -539,8 +574,31 @@ async def main():
         default=8000,
         help="Port for SSE server (default: 8000)",
     )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        help="API key for authentication (can also be set via MCP_API_KEY environment variable)",
+    )
+    parser.add_argument(
+        "--disable-auth",
+        action="store_true",
+        help="Disable authentication (not recommended for production)",
+    )
 
     args = parser.parse_args()
+
+    # Initialize authentication
+    global authenticator
+    try:
+        auth_config = AuthConfig.from_env_and_args(
+            api_key_arg=args.api_key,
+            disable_auth_arg=args.disable_auth,
+        )
+        authenticator = Authenticator(auth_config)
+        logger.info("Authentication initialized successfully")
+    except AuthError as e:
+        logger.error(f"Authentication setup failed: {e}")
+        sys.exit(1)
 
     # Store the access mode in the global variable
     global current_access_mode
@@ -553,6 +611,11 @@ async def main():
         mcp.add_tool(execute_sql, description="Execute a read-only SQL query")
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
+    
+    # For stdio transport, validate authentication at startup
+    if args.transport == "stdio" and authenticator and not authenticator.config.disable_auth:
+        logger.info("Authentication is enabled for stdio transport")
+        logger.info("Clients must provide a valid API key via MCP_API_KEY environment variable")
 
     # Get database URL from environment variable or command line
     database_url = os.environ.get("DATABASE_URI", args.database_url)
@@ -589,10 +652,12 @@ async def main():
     if args.transport == "stdio":
         await mcp.run_stdio_async()
     else:
+        # Create authenticated MCP instance for SSE transport
+        authenticated_mcp = create_authenticated_mcp()
         # Update FastMCP settings based on command line arguments
-        mcp.settings.host = args.sse_host
-        mcp.settings.port = args.sse_port
-        await mcp.run_sse_async()
+        authenticated_mcp.settings.host = args.sse_host
+        authenticated_mcp.settings.port = args.sse_port
+        await authenticated_mcp.run_sse_async()
 
 
 async def shutdown(sig=None):
