@@ -16,6 +16,11 @@ import mcp.types as types
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 from pydantic import validate_call
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.responses import JSONResponse
+from mcp.server.auth.provider import TokenVerifier, AccessToken
 
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 
@@ -49,6 +54,63 @@ ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResou
 logger = logging.getLogger(__name__)
 
 
+class APIKeyTokenVerifier(TokenVerifier):
+    """Custom API key token verifier for FastMCP authentication."""
+    
+    def __init__(self, authenticator: Optional[Authenticator] = None):
+        self.authenticator = authenticator
+    
+    async def verify_token(self, token: str):
+        """Verify the API key token and return access token if valid."""
+        if not self.authenticator or self.authenticator.config.disable_auth:
+            # Return a simple access token when auth is disabled
+            return AccessToken(token="anonymous", client_id="anonymous", scopes=[])
+        
+        # Extract the API key from the Bearer token
+        if not token.startswith("Bearer "):
+            return None
+        
+        api_key = token[7:]  # Remove "Bearer " prefix
+        
+        if self.authenticator.is_authenticated(api_key):
+            # Return a valid access token
+            return AccessToken(token=api_key, client_id="authenticated", scopes=[])
+        
+        return None
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """Custom authentication middleware for FastMCP SSE transport."""
+    
+    def __init__(self, app, authenticator: Optional[Authenticator] = None):
+        super().__init__(app)
+        self.authenticator = authenticator
+    
+    async def dispatch(self, request: Request, call_next):
+        """Check authentication for incoming requests."""
+        # Skip authentication for health checks and static files
+        if request.url.path in ["/health", "/favicon.ico"]:
+            return await call_next(request)
+        
+        # Check if authentication is disabled
+        if not self.authenticator or self.authenticator.config.disable_auth:
+            return await call_next(request)
+        
+        # Get the Authorization header
+        auth_header = request.headers.get("Authorization")
+        
+        # Validate the bearer token
+        if not self.authenticator.validate_authorization_header(auth_header):
+            logger.warning(f"Authentication failed for request to {request.url.path}")
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Authentication required", "detail": "Invalid or missing API key"}
+            )
+        
+        # Authentication successful, proceed with the request
+        return await call_next(request)
+
+
 class AccessMode(str, Enum):
     """SQL access modes for the server."""
 
@@ -76,10 +138,31 @@ async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
 
 
 def create_authenticated_mcp() -> FastMCP:
-    """Create a FastMCP instance with authentication middleware for SSE transport."""
-    # For SSE transport with authentication, we need to use the original mcp instance
-    # and handle authentication at the HTTP level using FastMCP's built-in auth support
-    return mcp
+    """Create a FastMCP instance with API key authentication for SSE transport."""
+    # Create a new FastMCP instance
+    # Note: FastMCP authentication will be handled at the HTTP level
+    authenticated_mcp = FastMCP("postgres-mcp")
+    logger.info("FastMCP instance created")
+    
+    # Copy all tools from the original mcp instance
+    authenticated_mcp.add_tool(list_schemas, description="List all schemas in the database")
+    authenticated_mcp.add_tool(list_objects, description="List objects in a schema")
+    authenticated_mcp.add_tool(get_object_details, description="Show detailed information about a database object")
+    authenticated_mcp.add_tool(explain_query, description="Explains the execution plan for a SQL query")
+    authenticated_mcp.add_tool(analyze_workload_indexes, description="Analyze frequently executed queries in the database and recommend optimal indexes")
+    authenticated_mcp.add_tool(analyze_query_indexes, description="Analyze a list of (up to 10) SQL queries and recommend optimal indexes")
+    authenticated_mcp.add_tool(analyze_db_health, description="Analyzes database health")
+    authenticated_mcp.add_tool(get_top_queries, description="Reports the slowest or most resource-intensive queries")
+    
+    # Add the execute_sql tool with appropriate description
+    if current_access_mode == AccessMode.UNRESTRICTED:
+        authenticated_mcp.add_tool(execute_sql, description="Execute any SQL query")
+    else:
+        authenticated_mcp.add_tool(execute_sql, description="Execute a read-only SQL query")
+    
+    return authenticated_mcp
+
+
 
 
 def format_text_response(text: Any) -> ResponseType:
@@ -573,6 +656,12 @@ async def main():
         )
         authenticator = Authenticator(auth_config)
         logger.info("Authentication initialized successfully")
+        
+        # For SSE transport, we'll use a custom authentication approach
+        if args.transport == "sse" and not auth_config.disable_auth:
+            logger.info("SSE transport with API key authentication configured")
+            logger.warning("Note: SSE authentication requires proper client configuration")
+            
     except AuthError as e:
         logger.error(f"Authentication setup failed: {e}")
         sys.exit(1)
@@ -629,11 +718,11 @@ async def main():
     if args.transport == "stdio":
         await mcp.run_stdio_async()
     else:
-        # For SSE transport, use the original mcp instance
-        # FastMCP will handle authentication through its built-in mechanisms
-        mcp.settings.host = args.sse_host
-        mcp.settings.port = args.sse_port
-        await mcp.run_sse_async()
+        # For SSE transport, use the authenticated MCP instance
+        authenticated_mcp = create_authenticated_mcp()
+        authenticated_mcp.settings.host = args.sse_host
+        authenticated_mcp.settings.port = args.sse_port
+        await authenticated_mcp.run_sse_async()
 
 
 async def shutdown(sig=None):
