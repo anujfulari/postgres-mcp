@@ -620,6 +620,11 @@ async def main():
         action="store_true",
         help="Disable authentication (not recommended for production)",
     )
+    parser.add_argument(
+        "--allow-insecure-sse",
+        action="store_true",
+        help="Allow SSE without server-enforced auth if middleware can't attach (NOT recommended)",
+    )
 
     args = parser.parse_args()
 
@@ -700,6 +705,7 @@ async def main():
         # Attach auth middleware when possible so Authorization header is enforced
         try:
             fastapi_app = getattr(authenticated_mcp, "app", None)
+            middleware_attached = False
             if (
                 authenticator
                 and not authenticator.config.disable_auth
@@ -709,6 +715,7 @@ async def main():
             ):
                 fastapi_app.add_middleware(AuthMiddleware, authenticator=authenticator)
                 logger.info("SSE authentication middleware attached (Authorization: Bearer <api-key>)")
+                middleware_attached = True
             else:
                 # Best-effort notice if we cannot attach middleware due to FastMCP API differences
                 if authenticator and not authenticator.config.disable_auth:
@@ -717,6 +724,20 @@ async def main():
                     )
         except Exception as e:
             logger.warning(f"Unable to attach SSE auth middleware: {e}")
+            middleware_attached = False
+
+        # If auth is required and we couldn't attach middleware, fail fast unless explicitly allowed
+        if (
+            authenticator
+            and not authenticator.config.disable_auth
+            and not middleware_attached
+            and not args.allow_insecure_sse
+        ):
+            logger.error(
+                "Refusing to start SSE without enforced auth. Upgrade FastMCP (app middleware support) or run behind a proxy, "
+                "or pass --allow-insecure-sse to override (NOT recommended)."
+            )
+            sys.exit(1)
 
         authenticated_mcp.settings.host = args.sse_host
         authenticated_mcp.settings.port = args.sse_port
