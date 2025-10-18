@@ -19,6 +19,7 @@ from pydantic import validate_call
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+import requests
 
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 
@@ -96,7 +97,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
             logger.warning(f"Authentication failed for request to {request.url.path}")
             return JSONResponse(
                 status_code=401,
-                content={"error": "Authentication required", "detail": "Invalid or missing access token"}
+                content={"error": "Authentication required", "detail": "Invalid or missing access token"},
+                headers={"WWW-Authenticate": "Bearer"},
             )
         
         # Authentication successful, proceed with the request
@@ -812,6 +814,47 @@ async def main():
                 # Enforce Authorization header via middleware
                 app.add_middleware(AuthMiddleware, authenticator=authenticator)
                 logger.info("SSE authentication middleware attached (Authorization: Bearer <access-token>)")
+
+                # Add well-known discovery endpoints on SSE app for OAuth/OIDC discovery
+                assert authenticator is not None
+                authn = authenticator
+                def _openid_doc() -> dict[str, Any]:
+                    issuer = authn.config.oauth_issuer or ""
+                    jwks = authn.config.oauth_jwks_url or ""
+                    token_endpoint = (issuer.rstrip("/") + "/oauth/token") if issuer else ""
+                    return {
+                        "issuer": issuer,
+                        "jwks_uri": jwks or (issuer.rstrip("/") + "/.well-known/jwks.json" if issuer else ""),
+                        "token_endpoint": token_endpoint,
+                        "grant_types_supported": ["client_credentials"],
+                        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+                    }
+
+                async def _openid_config(request: Request):  # noqa: ARG001 - required signature
+                    return JSONResponse(_openid_doc())
+
+                async def _rfc8414_config(request: Request):  # noqa: ARG001 - required signature
+                    return JSONResponse(_openid_doc())
+
+                async def _jwks_proxy(request: Request):  # noqa: ARG001 - required signature
+                    jwks_url = authn.config.oauth_jwks_url
+                    if not jwks_url:
+                        return JSONResponse({"error": "jwks_unavailable"}, status_code=404)
+                    try:
+                        resp = requests.get(jwks_url, timeout=5)
+                        resp.raise_for_status()
+                        return JSONResponse(resp.json())
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"Failed to fetch JWKS from issuer: {e}")
+                        return JSONResponse({"error": "jwks_fetch_failed"}, status_code=502)
+
+                # Register both root and /sse path variants to accommodate reverse proxies
+                app.add_route("/.well-known/openid-configuration", _openid_config, methods=["GET"])  # type: ignore[arg-type]
+                app.add_route("/.well-known/oauth-authorization-server", _rfc8414_config, methods=["GET"])  # type: ignore[arg-type]
+                app.add_route("/.well-known/jwks.json", _jwks_proxy, methods=["GET"])  # type: ignore[arg-type]
+                app.add_route("/sse/.well-known/openid-configuration", _openid_config, methods=["GET"])  # type: ignore[arg-type]
+                app.add_route("/sse/.well-known/oauth-authorization-server", _rfc8414_config, methods=["GET"])  # type: ignore[arg-type]
+                app.add_route("/sse/.well-known/jwks.json", _jwks_proxy, methods=["GET"])  # type: ignore[arg-type]
 
                 config = uvicorn.Config(
                     app,
